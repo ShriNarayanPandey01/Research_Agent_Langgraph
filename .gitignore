@@ -1,0 +1,41 @@
+# Environment variables (sensitive data)
+.env
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environment
+myenv/
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Web scraper cache
+.web_scraper_cache/
+
+# Generated reports (optional - comment out if you want to track them)
+# *.pdf
+# *.txt
+# *.json
+
+# Logs
+*.log
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
