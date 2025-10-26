@@ -13,7 +13,8 @@ from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, BaseMessage
 from langchain_core.tools import tool
 from langchain_core.documents import Document
-from langchain_chroma import Chroma
+from langchain_postgres import PGVector
+from langchain_postgres.vectorstores import PGVector as PGVectorStore
 from pydantic import BaseModel, Field
 import json
 from datetime import datetime
@@ -63,23 +64,52 @@ class WebScraperAgent:
     - Persistent storage to avoid redundant searches
     """
     
-    def __init__(self, api_key: str = None, cache_dir: str = ".web_scraper_cache"):
+    def __init__(self, api_key: str = None, cache_dir: str = ".web_scraper_cache", 
+                 use_pgvector: bool = True, pg_connection_string: str = None):
         self.llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.2, api_key=api_key)
         self.openai_client = OpenAI(api_key=api_key) if api_key else OpenAI()
         self.name = "WebScraperAgent"
         
-        # Initialize RAG cache directory
+        # Initialize embeddings for RAG
+        self.embeddings = OpenAIEmbeddings(api_key=api_key)
+        
+        # Initialize pgvector RAG if enabled
+        self.use_pgvector = use_pgvector
+        self.vector_store = None
+        
+        if use_pgvector:
+            # Default connection string for your pgvector container
+            if pg_connection_string is None:
+                pg_connection_string = (
+                    "postgresql+psycopg2://shri:shri123@localhost:6024/vectordb"
+                )
+            
+            try:
+                self.vector_store = PGVectorStore(
+                    embeddings=self.embeddings,
+                    collection_name="research_cache",
+                    connection=pg_connection_string,
+                    use_jsonb=True,
+                )
+                print(f"   📚 pgvector RAG initialized: Connected to PostgreSQL")
+            except Exception as e:
+                print(f"   ⚠️  pgvector initialization failed: {e}")
+                print(f"   📚 Falling back to file-based cache")
+                self.use_pgvector = False
+        
+        # Fallback: File-based cache directory
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(exist_ok=True)
         
         # In-memory cache for quick lookups
         self._memory_cache = {}
         
-        # Load existing cache index
+        # Load existing cache index (for file-based cache)
         self.cache_index_file = self.cache_dir / "cache_index.json"
         self.cache_index = self._load_cache_index()
         
-        print(f"   📚 RAG Cache initialized: {len(self.cache_index)} entries loaded")
+        if not use_pgvector or self.vector_store is None:
+            print(f"   📚 File Cache initialized: {len(self.cache_index)} entries loaded")
     
     def _load_cache_index(self) -> Dict[str, Dict]:
         """Load the cache index from disk"""
@@ -101,14 +131,32 @@ class WebScraperAgent:
         combined = f"{query}|{context}".lower().strip()
         return hashlib.md5(combined.encode()).hexdigest()
     
-    def _get_from_cache(self, query_hash: str) -> Dict[str, Any]:
+    def _get_from_cache(self, query_hash: str, query: str = "") -> Dict[str, Any]:
         """Retrieve cached results if available"""
         # Check memory cache first
         if query_hash in self._memory_cache:
             print(f"     💾 Cache HIT (memory): {query_hash[:8]}...")
             return self._memory_cache[query_hash]
         
-        # Check disk cache
+        # Check pgvector if enabled
+        if self.use_pgvector and self.vector_store:
+            try:
+                # Search for similar queries in vector store
+                docs = self.vector_store.similarity_search(
+                    query if query else query_hash, 
+                    k=1,
+                    filter={"query_hash": query_hash}
+                )
+                
+                if docs and len(docs) > 0:
+                    cached_data = json.loads(docs[0].page_content)
+                    self._memory_cache[query_hash] = cached_data
+                    print(f"     💾 Cache HIT (pgvector): {query_hash[:8]}...")
+                    return cached_data
+            except Exception as e:
+                print(f"     ⚠️  pgvector search error: {e}")
+        
+        # Fallback to disk cache
         if query_hash in self.cache_index:
             cache_file = self.cache_dir / f"{query_hash}.pkl"
             if cache_file.exists():
@@ -134,7 +182,24 @@ class WebScraperAgent:
         # Save to memory
         self._memory_cache[query_hash] = data
         
-        # Save to disk
+        # Save to pgvector if enabled
+        if self.use_pgvector and self.vector_store:
+            try:
+                doc = Document(
+                    page_content=json.dumps(data, ensure_ascii=False),
+                    metadata={
+                        "query": query,
+                        "query_hash": query_hash,
+                        "timestamp": datetime.now().isoformat(),
+                        "type": "research_cache"
+                    }
+                )
+                self.vector_store.add_documents([doc])
+                print(f"     💾 Cached to pgvector: {query_hash[:8]}...")
+            except Exception as e:
+                print(f"     ⚠️  pgvector save error: {e}, falling back to disk")
+        
+        # Also save to disk as backup
         cache_file = self.cache_dir / f"{query_hash}.pkl"
         with open(cache_file, 'wb') as f:
             pickle.dump(data, f)
@@ -147,7 +212,8 @@ class WebScraperAgent:
         }
         self._save_cache_index()
         
-        print(f"     💾 Cached results: {query_hash[:8]}...")
+        if not (self.use_pgvector and self.vector_store):
+            print(f"     💾 Cached to disk: {query_hash[:8]}...")
     
     def _search_web_openai(self, query: str) -> Dict[str, Any]:
         """
@@ -272,7 +338,7 @@ class WebScraperAgent:
         
         # Check cache (unless force refresh)
         if not force_refresh:
-            cached_result = self._get_from_cache(query_hash)
+            cached_result = self._get_from_cache(query_hash, query)
             if cached_result:
                 return cached_result
         
