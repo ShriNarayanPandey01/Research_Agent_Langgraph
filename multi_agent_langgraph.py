@@ -25,7 +25,7 @@ Agents:
 
 from typing import TypedDict, List, Dict, Any, Annotated, Literal
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, BaseMessage
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, BaseMessage, ToolMessage
 from langchain_core.tools import tool
 from langchain_core.documents import Document
 from langchain_postgres import PGVector
@@ -948,10 +948,11 @@ def web_scraper_node(state: ResearchState) -> ResearchState:
 
 def deep_analysis_node(state: ResearchState) -> ResearchState:
     """
-    Deep Analysis Agent: Analyze using all 4 analysis tools
+    Deep Analysis Agent: Analyze using all 4 analysis tools via ReAct agent
+    Uses LLM to intelligently decide which tools to use and in what order
     """
     print(f"        🔬 Step 2: Deep Analysis...")
-    print(f"     🔧 Using all 4 analysis tools...")
+    print(f"     🤖 Using ReAct agent with 4 analysis tools...")
     
     current_task = state['current_task']
     web_data = state['web_data']
@@ -959,49 +960,141 @@ def deep_analysis_node(state: ResearchState) -> ResearchState:
     # Prepare data for tools
     data_str = json.dumps(web_data.get('retrieved_data', {}), indent=2)[:1500]
     
-    # Run all 4 analysis tools
-    tools_results = {}
-    tools_used = ['comparative_analysis', 'trend_analysis', 'causal_reasoning', 'statistical_analysis']
-    
-    print(f"        🔄 Running comparative_analysis...")
-    try:
-        comp_result = comparative_analysis_tool.invoke(data_str)
-        tools_results['comparative_analysis'] = comp_result
-        print(f"        ✅ comparative_analysis complete")
-    except Exception as e:
-        print(f"        ⚠️  comparative_analysis error: {e}")
-        tools_results['comparative_analysis'] = json.dumps({"error": str(e)})
-    
-    print(f"        🔄 Running trend_analysis...")
-    try:
-        trend_result = trend_analysis_tool.invoke(data_str)
-        tools_results['trend_analysis'] = trend_result
-        print(f"        ✅ trend_analysis complete")
-    except Exception as e:
-        print(f"        ⚠️  trend_analysis error: {e}")
-        tools_results['trend_analysis'] = json.dumps({"error": str(e)})
-    
-    print(f"        🔄 Running causal_reasoning...")
-    try:
-        causal_result = causal_reasoning_tool.invoke(data_str)
-        tools_results['causal_reasoning'] = causal_result
-        print(f"        ✅ causal_reasoning complete")
-    except Exception as e:
-        print(f"        ⚠️  causal_reasoning error: {e}")
-        tools_results['causal_reasoning'] = json.dumps({"error": str(e)})
-    
-    print(f"        🔄 Running statistical_analysis...")
-    try:
-        stat_result = statistical_analysis_tool.invoke(data_str)
-        tools_results['statistical_analysis'] = stat_result
-        print(f"        ✅ statistical_analysis complete")
-    except Exception as e:
-        print(f"        ⚠️  statistical_analysis error: {e}")
-        tools_results['statistical_analysis'] = json.dumps({"error": str(e)})
-    
-    # Synthesize all analysis results
-    print(f"     🧠 Synthesizing analysis results...")
+    # Create LLM for the agent
     llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.3)
+    
+    # Define the analysis tools for the agent
+    analysis_tools = [
+        comparative_analysis_tool,
+        trend_analysis_tool,
+        causal_reasoning_tool,
+        statistical_analysis_tool
+    ]
+    
+    # Create system prompt for the agent
+    system_prompt = SystemMessage(content="""You are a Deep Analysis expert. Your task is to perform comprehensive analysis using ALL 4 available tools.
+
+CRITICAL INSTRUCTIONS:
+1. You MUST use ALL 4 tools: comparative_analysis_tool, trend_analysis_tool, causal_reasoning_tool, and statistical_analysis_tool
+2. Use each tool exactly once to analyze different aspects of the data
+3. Pass the provided data to each tool
+4. After using all 4 tools, provide a comprehensive synthesis
+
+Your response should demonstrate use of all tools and provide integrated insights.""")
+
+    # Create ReAct agent for deep analysis
+    agent = create_react_agent(llm, analysis_tools)
+    
+    # Prepare agent input with explicit task to run ALL tools
+    agent_input = {
+        "messages": [
+            SystemMessage(content="""You are a Deep Analysis expert. You have 4 analysis tools that you MUST use for every task.
+
+MANDATORY WORKFLOW:
+Step 1: Use comparative_analysis_tool - Compare different aspects and alternatives
+Step 2: Use trend_analysis_tool - Identify patterns and trends over time
+Step 3: Use causal_reasoning_tool - Analyze cause-effect relationships
+Step 4: Use statistical_analysis_tool - Perform statistical analysis
+Step 5: After using ALL 4 tools, synthesize the insights
+
+YOU MUST COMPLETE ALL 5 STEPS. Do not skip any tool."""),
+            HumanMessage(content=f"""Task: {current_task['query']}
+
+Research Data to Analyze:
+{data_str}
+
+INSTRUCTIONS:
+1. First, use comparative_analysis_tool with the above data
+2. Then, use trend_analysis_tool with the above data
+3. Then, use causal_reasoning_tool with the above data
+4. Then, use statistical_analysis_tool with the above data
+5. Finally, provide a comprehensive synthesis of all 4 analyses
+
+Execute each step sequentially and use ALL 4 tools before providing your final answer.""")
+        ]
+    }
+    
+    # Run the agent
+    try:
+        agent_response = agent.invoke(agent_input)
+        
+        # Extract tool calls and results
+        tools_used = []
+        tools_results = {}
+        
+        for message in agent_response.get('messages', []):
+            if hasattr(message, 'tool_calls') and message.tool_calls:
+                for tool_call in message.tool_calls:
+                    tool_name = tool_call.get('name', '')
+                    if tool_name:
+                        # Map tool names
+                        clean_name = tool_name.replace('_tool', '')
+                        tools_used.append(clean_name)
+                        print(f"        🔄 Agent used: {clean_name}")
+            
+            # Collect tool responses
+            if hasattr(message, 'content') and isinstance(message, ToolMessage):
+                tool_name = getattr(message, 'name', 'unknown')
+                clean_name = tool_name.replace('_tool', '')
+                tools_results[clean_name] = message.content
+                print(f"        ✅ {clean_name} complete")
+        
+        # Get final synthesis from agent
+        final_message = agent_response['messages'][-1]
+        synthesis = final_message.content if hasattr(final_message, 'content') else "Analysis completed"
+        
+        # If agent didn't use all tools, fall back to ensure all are called
+        required_tools = ['comparative_analysis', 'trend_analysis', 'causal_reasoning', 'statistical_analysis']
+        missing_tools = [t for t in required_tools if t not in tools_used]
+        
+        if missing_tools:
+            print(f"     ⚠️  Agent missed tools: {missing_tools}. Running them now...")
+            for tool_name in missing_tools:
+                try:
+                    if tool_name == 'comparative_analysis':
+                        result = comparative_analysis_tool.invoke(data_str)
+                    elif tool_name == 'trend_analysis':
+                        result = trend_analysis_tool.invoke(data_str)
+                    elif tool_name == 'causal_reasoning':
+                        result = causal_reasoning_tool.invoke(data_str)
+                    elif tool_name == 'statistical_analysis':
+                        result = statistical_analysis_tool.invoke(data_str)
+                    
+                    tools_results[tool_name] = result
+                    tools_used.append(tool_name)
+                    print(f"        ✅ {tool_name} complete (fallback)")
+                except Exception as e:
+                    print(f"        ⚠️  {tool_name} error: {e}")
+                    tools_results[tool_name] = json.dumps({"error": str(e)})
+        
+    except Exception as e:
+        print(f"     ⚠️  Agent error: {e}. Falling back to direct tool calls...")
+        # Fallback to direct calls if agent fails
+        tools_results = {}
+        tools_used = ['comparative_analysis', 'trend_analysis', 'causal_reasoning', 'statistical_analysis']
+        
+        for tool_name in tools_used:
+            try:
+                if tool_name == 'comparative_analysis':
+                    result = comparative_analysis_tool.invoke(data_str)
+                elif tool_name == 'trend_analysis':
+                    result = trend_analysis_tool.invoke(data_str)
+                elif tool_name == 'causal_reasoning':
+                    result = causal_reasoning_tool.invoke(data_str)
+                elif tool_name == 'statistical_analysis':
+                    result = statistical_analysis_tool.invoke(data_str)
+                
+                tools_results[tool_name] = result
+                print(f"        ✅ {tool_name} complete")
+            except Exception as tool_error:
+                print(f"        ⚠️  {tool_name} error: {tool_error}")
+                tools_results[tool_name] = json.dumps({"error": str(tool_error)})
+        
+        synthesis = "Analysis completed via fallback mechanism"
+    
+    # Create final synthesis if not comprehensive enough
+    print(f"     🧠 Final synthesis...")
+    synthesis_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.3)
     
     synthesis_prompt = f"""Synthesize the following analysis results into comprehensive insights:
 
@@ -1019,9 +1112,12 @@ Causal Reasoning:
 Statistical Analysis:
 {tools_results.get('statistical_analysis', 'N/A')[:500]}
 
+Agent Synthesis:
+{synthesis[:500]}
+
 Provide a comprehensive synthesis combining all analyses."""
     
-    synthesis_response = llm.invoke([
+    final_synthesis = synthesis_llm.invoke([
         SystemMessage(content="You are an expert at synthesizing multiple analysis results into coherent insights."),
         HumanMessage(content=synthesis_prompt)
     ])
@@ -1033,7 +1129,8 @@ Provide a comprehensive synthesis combining all analyses."""
         "web_data": web_data,
         "tools_used": tools_used,
         "tool_results": tools_results,
-        "synthesis": synthesis_response.content,
+        "agent_synthesis": synthesis,
+        "final_synthesis": final_synthesis.content,
         "timestamp": datetime.now().isoformat()
     }
     
@@ -1041,7 +1138,7 @@ Provide a comprehensive synthesis combining all analyses."""
     analysis_results = state.get('analysis_results', [])
     analysis_results.append(analysis_result)
     
-    print(f"        ✅ Analysis complete using: {', '.join(tools_used)}\n")
+    print(f"        ✅ Analysis complete using: {', '.join(set(tools_used))}\n")
     
     return {
         **state,
@@ -1052,10 +1149,11 @@ Provide a comprehensive synthesis combining all analyses."""
 
 def fact_checker_node(state: ResearchState) -> ResearchState:
     """
-    Fact Checker Agent: Validate using all 4 validation tools
+    Fact Checker Agent: Validate using all 4 validation tools via ReAct agent
+    Uses LLM to intelligently decide how to use validation tools
     """
     print(f"        ✅ Step 3: Fact Checking...")
-    print(f"     🔧 Using all 4 validation tools...")
+    print(f"     🤖 Using ReAct agent with 4 validation tools...")
     
     current_task = state['current_task']
     current_index = state['current_task_index']
@@ -1068,51 +1166,143 @@ def fact_checker_node(state: ResearchState) -> ResearchState:
     # Prepare data for validation
     data_str = json.dumps(latest_analysis, indent=2, default=str)[:1500]
     
-    # Run all 4 validation tools
-    tools_results = {}
-    tools_used = ['source_credibility_check', 'cross_reference', 'confidence_score', 'contradiction_detector']
-    
-    print(f"        🔍 Running source_credibility_check...")
-    try:
-        cred_result = source_credibility_checker.invoke(data_str)
-        tools_results['source_credibility'] = cred_result
-        print(f"        ✅ source_credibility complete")
-    except Exception as e:
-        print(f"        ⚠️  source_credibility error: {e}")
-        tools_results['source_credibility'] = json.dumps({"error": str(e)})
-    
-    print(f"        🔗 Running cross_reference...")
-    try:
-        cross_result = cross_reference_validator.invoke(data_str)
-        tools_results['cross_reference'] = cross_result
-        print(f"        ✅ cross_reference complete")
-    except Exception as e:
-        print(f"        ⚠️  cross_reference error: {e}")
-        tools_results['cross_reference'] = json.dumps({"error": str(e)})
-    
-    print(f"        📊 Running confidence_score_calculator...")
-    try:
-        conf_result = confidence_score_calculator.invoke(data_str)
-        tools_results['confidence_score'] = conf_result
-        print(f"        ✅ confidence_score complete")
-    except Exception as e:
-        print(f"        ⚠️  confidence_score error: {e}")
-        tools_results['confidence_score'] = json.dumps({"error": str(e)})
-    
-    print(f"        ⚠️  Running contradiction_detector...")
-    try:
-        contra_result = contradiction_detector.invoke(data_str)
-        tools_results['contradiction_detector'] = contra_result
-        print(f"        ✅ contradiction_detector complete")
-    except Exception as e:
-        print(f"        ⚠️  contradiction_detector error: {e}")
-        tools_results['contradiction_detector'] = json.dumps({"error": str(e)})
-    
-    # Synthesize validation results
-    print(f"     🧠 Synthesizing validation results...")
+    # Create LLM for the agent
     llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.1)
     
+    # Define the validation tools for the agent
+    validation_tools = [
+        source_credibility_checker,
+        cross_reference_validator,
+        confidence_score_calculator,
+        contradiction_detector
+    ]
+    
+    # Create ReAct agent for fact checking
+    agent = create_react_agent(llm, validation_tools)
+    
+    # Prepare agent input with explicit task to run ALL tools
+    agent_input = {
+        "messages": [
+            SystemMessage(content="""You are a Fact Checking expert. You have 4 validation tools that you MUST use for every task.
+
+MANDATORY WORKFLOW:
+Step 1: Use source_credibility_checker - Verify credibility of sources
+Step 2: Use cross_reference_validator - Cross-check facts across sources
+Step 3: Use confidence_score_calculator - Calculate confidence in findings
+Step 4: Use contradiction_detector - Detect contradictions in data
+Step 5: After using ALL 4 tools, synthesize the validation results
+
+YOU MUST COMPLETE ALL 5 STEPS. Do not skip any tool."""),
+            HumanMessage(content=f"""Task: Validate the analysis for {current_task['query']}
+
+Analysis Data to Validate:
+{data_str}
+
+INSTRUCTIONS:
+1. First, use source_credibility_checker with the above data
+2. Then, use cross_reference_validator with the above data
+3. Then, use confidence_score_calculator with the above data
+4. Then, use contradiction_detector with the above data
+5. Finally, provide a comprehensive validation assessment of all 4 checks
+
+Execute each step sequentially and use ALL 4 tools before providing your final answer.""")
+        ]
+    }
+    
+    # Run the agent
+    try:
+        agent_response = agent.invoke(agent_input)
+        
+        # Extract tool calls and results
+        tools_used = []
+        tools_results = {}
+        
+        for message in agent_response.get('messages', []):
+            if hasattr(message, 'tool_calls') and message.tool_calls:
+                for tool_call in message.tool_calls:
+                    tool_name = tool_call.get('name', '')
+                    if tool_name:
+                        # Map tool names
+                        clean_name = tool_name.replace('_checker', '').replace('_validator', '').replace('_calculator', '').replace('_detector', '')
+                        tools_used.append(clean_name)
+                        print(f"        🔍 Agent used: {clean_name}")
+            
+            # Collect tool responses
+            if hasattr(message, 'content') and isinstance(message, ToolMessage):
+                tool_name = getattr(message, 'name', 'unknown')
+                clean_name = tool_name.replace('_checker', '').replace('_validator', '').replace('_calculator', '').replace('_detector', '')
+                tools_results[clean_name] = message.content
+                print(f"        ✅ {clean_name} complete")
+        
+        # Get final synthesis from agent
+        final_message = agent_response['messages'][-1]
+        synthesis = final_message.content if hasattr(final_message, 'content') else "Validation completed"
+        
+        # If agent didn't use all tools, fall back to ensure all are called
+        required_tools = ['source_credibility', 'cross_reference', 'confidence_score', 'contradiction']
+        missing_tools = [t for t in required_tools if t not in [clean.replace('_check', '').replace('_score', '') for clean in tools_used]]
+        
+        if missing_tools:
+            print(f"     ⚠️  Agent missed tools: {missing_tools}. Running them now...")
+            for tool_name in missing_tools:
+                try:
+                    if 'source' in tool_name or 'credibility' in tool_name:
+                        result = source_credibility_checker.invoke(data_str)
+                        tools_results['source_credibility'] = result
+                        tools_used.append('source_credibility_check')
+                    elif 'cross' in tool_name or 'reference' in tool_name:
+                        result = cross_reference_validator.invoke(data_str)
+                        tools_results['cross_reference'] = result
+                        tools_used.append('cross_reference')
+                    elif 'confidence' in tool_name or 'score' in tool_name:
+                        result = confidence_score_calculator.invoke(data_str)
+                        tools_results['confidence_score'] = result
+                        tools_used.append('confidence_score')
+                    elif 'contradiction' in tool_name:
+                        result = contradiction_detector.invoke(data_str)
+                        tools_results['contradiction_detector'] = result
+                        tools_used.append('contradiction_detector')
+                    
+                    print(f"        ✅ {tool_name} complete (fallback)")
+                except Exception as e:
+                    print(f"        ⚠️  {tool_name} error: {e}")
+                    tools_results[tool_name] = json.dumps({"error": str(e)})
+        
+    except Exception as e:
+        print(f"     ⚠️  Agent error: {e}. Falling back to direct tool calls...")
+        # Fallback to direct calls if agent fails
+        tools_results = {}
+        tools_used = ['source_credibility_check', 'cross_reference', 'confidence_score', 'contradiction_detector']
+        
+        for tool_name in tools_used:
+            try:
+                if tool_name == 'source_credibility_check':
+                    result = source_credibility_checker.invoke(data_str)
+                    tools_results['source_credibility'] = result
+                elif tool_name == 'cross_reference':
+                    result = cross_reference_validator.invoke(data_str)
+                    tools_results['cross_reference'] = result
+                elif tool_name == 'confidence_score':
+                    result = confidence_score_calculator.invoke(data_str)
+                    tools_results['confidence_score'] = result
+                elif tool_name == 'contradiction_detector':
+                    result = contradiction_detector.invoke(data_str)
+                    tools_results['contradiction_detector'] = result
+                
+                print(f"        ✅ {tool_name} complete")
+            except Exception as tool_error:
+                print(f"        ⚠️  {tool_name} error: {tool_error}")
+                tools_results[tool_name] = json.dumps({"error": str(tool_error)})
+        
+        synthesis = "Validation completed via fallback mechanism"
+    
+    # Create final synthesis if not comprehensive enough
+    print(f"     🧠 Final validation synthesis...")
+    synthesis_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.1)
+    
     synthesis_prompt = f"""Synthesize the following validation results:
+
+Task: {current_task['query']}
 
 Source Credibility:
 {tools_results.get('source_credibility', 'N/A')[:300]}
@@ -1126,9 +1316,12 @@ Confidence Score:
 Contradiction Detection:
 {tools_results.get('contradiction_detector', 'N/A')[:300]}
 
-Provide overall validation assessment."""
+Agent Synthesis:
+{synthesis[:500]}
+
+Provide overall validation assessment combining all checks."""
     
-    synthesis_response = llm.invoke([
+    final_synthesis = synthesis_llm.invoke([
         SystemMessage(content="You are an expert at validating research findings."),
         HumanMessage(content=synthesis_prompt)
     ])
@@ -1139,7 +1332,8 @@ Provide overall validation assessment."""
         "analysis": latest_analysis,
         "tools_used": tools_used,
         "tool_results": tools_results,
-        "synthesis": synthesis_response.content,
+        "agent_synthesis": synthesis,
+        "final_synthesis": final_synthesis.content,
         "timestamp": datetime.now().isoformat()
     }
     
